@@ -103,6 +103,7 @@ def _load_specs_from_yaml(path: Path) -> list:
                     "phase": step_data.get("phase", "post"),
                     "per_scenario": bool(step_data.get("per_scenario", False)),
                     "per_run": bool(step_data.get("per_run", False)),
+                    "concurrency": int(step_data.get("concurrency", 1)),
                     "config": dict(step_data.get("config", {})),
                     "depends_on": list(step_data.get("depends_on", [])),
                 }

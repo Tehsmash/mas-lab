@@ -49,11 +49,17 @@ def _expand_depends_on(
     *,
     run_suffix: str | None = None,
     per_run_names: set[str] | None = None,
+    concurrent_run_names: set[str] | None = None,
 ) -> list[str]:
     expanded: list[str] = []
     per_run_names = per_run_names or set()
+    concurrent_run_names = concurrent_run_names or set()
     for dep in depends_on or []:
-        if run_suffix and dep in per_run_names:
+        if dep in concurrent_run_names:
+            # Dep is a wrapped concurrent batch — depend on the wrapper (base name)
+            # rather than individual per-run suffixed names.
+            expanded.append(dep)
+        elif run_suffix and dep in per_run_names:
             expanded.append(f"{dep}-{run_suffix}")
         elif dep in per_scenario_names:
             expanded.append(f"{dep}-{scenario_id}")
@@ -64,6 +70,44 @@ def _expand_depends_on(
 
 def _run_step_suffix(scenario: str, test: str, run: str) -> str:
     return f"{scenario}-{test}-{run}"
+
+
+def _build_wrapper_deps(
+    spec: Any,
+    per_run_names: set[str],
+    concurrent_run_names: set[str],
+    per_scenario_names: set[str],
+    scenario_ids: list[str],
+) -> list[str]:
+    """Build depends_on list for a ConcurrentRunnerStep wrapper.
+
+    Per-run deps onto sequential (non-wrapped) per_run steps are unsupported and
+    dropped with a warning. Per-run deps onto other wrapped steps resolve to the
+    wrapper name. Per-scenario deps are expanded. Global deps pass through.
+    """
+    base_name = spec.name or spec.type
+    wrapper_deps: list[str] = []
+    for dep in spec.depends_on or []:
+        if dep in concurrent_run_names:
+            # Other concurrent wrapper — depend on it at wrapper level
+            if dep not in wrapper_deps:
+                wrapper_deps.append(dep)
+        elif dep in per_run_names:
+            logger.warning(
+                "Step '%s' (concurrency=%d): depends_on '%s' is per_run=True but not "
+                "wrapped (concurrency=1). Cross-per-run dependencies are unsupported in "
+                "concurrent mode — dependency dropped. Use concurrency=1 to preserve ordering.",
+                base_name, int(getattr(spec, "concurrency", 1)), dep,
+            )
+        elif dep in per_scenario_names:
+            for sid in scenario_ids:
+                expanded = f"{dep}-{sid}"
+                if expanded not in wrapper_deps:
+                    wrapper_deps.append(expanded)
+        else:
+            if dep not in wrapper_deps:
+                wrapper_deps.append(dep)
+    return wrapper_deps
 
 
 def materialize_step_dicts(
@@ -90,6 +134,10 @@ def materialize_step_dicts(
     per_run_names = {
         _base_step_name(s) for s in phase_specs if getattr(s, "per_run", False)
     }
+    concurrent_run_names = {
+        _base_step_name(s) for s in phase_specs
+        if getattr(s, "per_run", False) and int(getattr(s, "concurrency", 1)) > 1
+    }
     step_dicts: list[dict] = []
     tmpl = template_vars or {}
     output_dir = Path(tmpl.get("output_dir", "."))
@@ -100,7 +148,7 @@ def materialize_step_dicts(
         is_per_run = getattr(spec, "per_run", False)
 
         if is_per_run:
-            scenario_filter = scenario_ids if is_per_scenario else None
+            concurrency = int(getattr(spec, "concurrency", 1))
             run_targets = []
             if is_per_scenario:
                 for sid in scenario_ids:
@@ -110,6 +158,7 @@ def materialize_step_dicts(
             else:
                 run_targets = discover_benchmark_runs(output_dir)
 
+            child_dicts: list[dict] = []
             for run_ref in run_targets:
                 cfg = copy.deepcopy(spec.config or {})
                 cfg.setdefault("scenario", run_ref.scenario)
@@ -131,8 +180,9 @@ def materialize_step_dicts(
                     per_scenario_names,
                     run_suffix=suffix,
                     per_run_names=per_run_names,
+                    concurrent_run_names=concurrent_run_names,
                 )
-                step_dicts.append(
+                child_dicts.append(
                     {
                         "name": name,
                         "type": spec.type,
@@ -141,6 +191,26 @@ def materialize_step_dicts(
                         "depends_on": deps,
                     }
                 )
+
+            if concurrency > 1 and child_dicts:
+                wrapper_deps = _build_wrapper_deps(
+                    spec, per_run_names, concurrent_run_names, per_scenario_names, scenario_ids
+                )
+                logger.info(
+                    "Step '%s' (%s): wrapping %d per-run instances with concurrency=%d",
+                    base_name, spec.type, len(child_dicts), concurrency,
+                )
+                step_dicts.append(
+                    {
+                        "name": base_name,
+                        "type": "__concurrent_runner__",
+                        "phase": getattr(spec, "phase", "post"),
+                        "config": {"steps": child_dicts, "concurrency": concurrency},
+                        "depends_on": wrapper_deps,
+                    }
+                )
+            else:
+                step_dicts.extend(child_dicts)
             continue
 
         targets = scenario_ids if is_per_scenario else [None]
@@ -165,6 +235,7 @@ def materialize_step_dicts(
                     sid,
                     per_scenario_names,
                     per_run_names=per_run_names,
+                    concurrent_run_names=concurrent_run_names,
                 )
                 if sid is not None
                 else list(spec.depends_on or [])
