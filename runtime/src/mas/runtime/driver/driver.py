@@ -1232,6 +1232,11 @@ class KernelDriver:
 
         if gov_is_hitl_pending(self.kernel.q):
             return
+        # Only sync when the current ingress is itself a TOOL_RESULT — searching
+        # events unconditionally picks up stale unsynced results from previous
+        # turns and writes them into the wrong WM slot (displacing the real result).
+        if not (isinstance(ingress, EngineIoReturn) and ingress.response_kind == "TOOL_RESULT"):
+            return
         ctx = self.ctx
         if ctx is None:
             return
@@ -1242,26 +1247,30 @@ class KernelDriver:
         synced: set[int] = getattr(store, "_synced_tool_result_cids", None) or set()
         store._synced_tool_result_cids = synced
 
-        cid = 0
-        text = ""
+        ingress_cid = ingress.correlation_id
+        if ingress_cid in synced:
+            return
         events = getattr(getattr(self.kernel, "run", None), "events", None) or []
         if not isinstance(events, (list, tuple)):
             events = []
-        for row in reversed(events):
-            if getattr(row, "response_kind", "") != "TOOL_RESULT":
-                continue
-            row_cid = int(getattr(row, "correlation_id", 0) or 0)
-            if row_cid and row_cid in synced:
-                continue
-            cid = row_cid
-            text = str(getattr(row, "text", "") or "")
-            break
-        if not cid and isinstance(ingress, EngineIoReturn) and ingress.response_kind == "TOOL_RESULT":
-            cid = ingress.correlation_id
-            text = ingress.text
-        if not cid and not str(text or "").strip():
-            return
-        if cid and cid in synced:
+
+        # Both ALLOW and SKIP now commit a RunEvent under the ingress cid:
+        # ALLOW via commit_engine_io_return (real text), SKIP via its own
+        # run.append (empty text — suppresses the result without leaking it).
+        # Cids are monotonically increasing so no stale prior-turn event can
+        # share ingress_cid; a single cid-matched lookup is sufficient.
+        cid = 0
+        text = ""
+        for row in events:
+            if int(getattr(row, "correlation_id", 0) or 0) == ingress_cid:
+                if getattr(row, "response_kind", "") == "TOOL_RESULT":
+                    cid = ingress_cid
+                    text = str(getattr(row, "text", "") or "")
+                break
+        if not cid:
+            # Event not yet committed (e.g. governance RETRY re-schedules the
+            # tool without writing a placeholder).  Nothing to write; the
+            # retried result will arrive separately.
             return
 
         open_id = getattr(store, "_open_tool_call_id", "") or ""

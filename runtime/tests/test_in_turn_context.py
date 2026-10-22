@@ -84,6 +84,12 @@ def test_driver_records_parallel_tool_calls_on_llm_return():
     )
     calls = ctx.working_memory.messages[0]["tool_calls"]
     assert [c["id"] for c in calls] == ["call_4_0", "call_4_1"]
+    # Simulate commit_engine_io_return appending the real event (ALLOW path).
+    real_event = MagicMock()
+    real_event.response_kind = "TOOL_RESULT"
+    real_event.correlation_id = 99
+    real_event.text = "search hits"
+    driver.kernel.run.events = [real_event]
     driver._sync_tool_result_memory(
         EngineIoReturn(
             correlation_id=99,
@@ -121,6 +127,14 @@ def test_hitl_allow_does_not_record_tool_result_before_tool_runs():
         HitlResolve(request_id=1, resolution=HitlResolveChoice.ALLOW)
     )
     assert [m["role"] for m in ctx.working_memory.messages] == ["assistant"]
+
+    # Simulate commit_engine_io_return appending the real event (ALLOW path).
+    real_event = MagicMock()
+    real_event.response_kind = "TOOL_RESULT"
+    real_event.correlation_id = 3
+    real_event.text = "search hits"
+    kernel.run.events = [real_event]
+
     driver._sync_tool_result_memory(
         EngineIoReturn(
             correlation_id=3,
@@ -153,7 +167,8 @@ def test_token_budget_trimmer():
 def test_tool_result_binds_to_llm_call_id_not_tool_egress_id():
     """Regression: tool egress correlation_id differs from LLM correlation_id."""
     ctx = AutoCtxAssembler()
-    driver = KernelDriver(kernel=MagicMock(), engine=MagicMock(), ctx=ctx)
+    kernel = MagicMock()
+    driver = KernelDriver(kernel=kernel, engine=MagicMock(), ctx=ctx)
     driver._record_working_memory(
         InvokeEngineIo(correlation_id=3, op="LLM_CALL"),
         EngineIoReturn(
@@ -174,6 +189,13 @@ def test_tool_result_binds_to_llm_call_id_not_tool_egress_id():
             text="Donald Trump is president.",
         ),
     )
+    # Simulate commit_engine_io_return appending the real event (ALLOW path).
+    real_event = MagicMock()
+    real_event.response_kind = "TOOL_RESULT"
+    real_event.correlation_id = 2
+    real_event.text = "Donald Trump is president."
+    kernel.run.events = [real_event]
+
     from mas.runtime.schema.ingress import EngineIoReturn as EIR
 
     driver._sync_tool_result_memory(
@@ -231,6 +253,120 @@ def test_react_loop_second_llm_sees_tool_result():
         "Who is current POTUS?",
     )
     assert rounds["n"] == 2
+
+
+def test_stale_tool_result_not_written_on_llm_ingress():
+    """Regression: _sync_tool_result_memory must not bind a stale unsynced
+    TOOL_RESULT from run.events when the current ingress is an LLM_CALL
+    (MODEL_TEXT) result.  Previously the unconditional events search would
+    pick up the old result and write it into the slot belonging to the new
+    LLM's tool call, causing the real tool result to be dropped."""
+    from unittest.mock import MagicMock
+
+    ctx = AutoCtxAssembler()
+    kernel = MagicMock()
+
+    # Simulate a stale TOOL_RESULT (cid=1) already in run.events from a
+    # previous step that was never synced.
+    stale_event = MagicMock()
+    stale_event.response_kind = "TOOL_RESULT"
+    stale_event.correlation_id = 1
+    stale_event.text = "stale-result"
+    kernel.run.events = [stale_event]
+    kernel.q.gov_state = "IDLE"
+    kernel.q.hitl_request_id = 0
+
+    driver = KernelDriver(kernel=kernel, engine=MagicMock(), ctx=ctx)
+
+    # New LLM call (cid=3) returns a tool call — assistant message is in WM.
+    driver._record_working_memory(
+        InvokeEngineIo(correlation_id=3, op="LLM_CALL"),
+        EngineIoReturn(
+            correlation_id=3,
+            response_kind="MODEL_TEXT",
+            next_step="TOOL_CALL",
+            tool_name="activate_skill",
+            tool_arguments={"name": "my-skill"},
+            text="",
+        ),
+    )
+    assert ctx.working_memory.messages[-1]["role"] == "assistant"
+
+    # Driver processes the LLM result (MODEL_TEXT ingress, cid=3).
+    # With the bug: stale cid=1 result gets written to WM under call_3.
+    # With the fix: nothing is written — MODEL_TEXT ingress is skipped.
+    driver._sync_tool_result_memory(
+        EngineIoReturn(
+            correlation_id=3,
+            response_kind="MODEL_TEXT",
+            next_step="TOOL_CALL",
+            text="",
+        )
+    )
+    # WM must still have only the assistant message — no stale tool result.
+    assert [m["role"] for m in ctx.working_memory.messages] == ["assistant"]
+
+    # Now the real tool result (cid=4) arrives.
+    real_event = MagicMock()
+    real_event.response_kind = "TOOL_RESULT"
+    real_event.correlation_id = 4
+    real_event.text = "real-skill-content"
+    kernel.run.events = [stale_event, real_event]
+
+    driver._sync_tool_result_memory(
+        EngineIoReturn(
+            correlation_id=4,
+            response_kind="TOOL_RESULT",
+            next_step="LLM_CALL",
+            text="real-skill-content",
+        )
+    )
+    tool_msgs = [m for m in ctx.working_memory.messages if m.get("role") == "tool"]
+    assert len(tool_msgs) == 1
+    assert tool_msgs[0]["content"] == "real-skill-content"
+    assert tool_msgs[0]["tool_call_id"] == "call_3"
+
+
+def test_governance_skip_writes_empty_tool_result():
+    """SKIP path: governance appends a placeholder RunEvent under the original
+    ingress cid with empty text.  _sync_tool_result_memory must write '' to WM
+    (not the real ingress text) so conversation structure is maintained without
+    leaking the suppressed content."""
+    ctx = AutoCtxAssembler()
+    kernel = MagicMock()
+
+    # Simulate SKIP: placeholder committed under the same cid as the ingress
+    # but with empty text (as ingress_step.py now does).
+    skip_event = MagicMock()
+    skip_event.response_kind = "TOOL_RESULT"
+    skip_event.correlation_id = 7
+    skip_event.text = ""
+    kernel.run.events = [skip_event]
+
+    driver = KernelDriver(kernel=kernel, engine=MagicMock(), ctx=ctx)
+    driver._record_working_memory(
+        InvokeEngineIo(correlation_id=5, op="LLM_CALL"),
+        EngineIoReturn(
+            correlation_id=5,
+            response_kind="MODEL_TEXT",
+            next_step="TOOL_CALL",
+            tool_name="some-tool",
+            tool_arguments={},
+            text="",
+        ),
+    )
+    driver._sync_tool_result_memory(
+        EngineIoReturn(
+            correlation_id=7,
+            response_kind="TOOL_RESULT",
+            next_step="LLM_CALL",
+            text="real-suppressed-content",
+        )
+    )
+    tool_msgs = [m for m in ctx.working_memory.messages if m.get("role") == "tool"]
+    assert len(tool_msgs) == 1
+    assert tool_msgs[0]["content"] == ""
+    assert tool_msgs[0]["tool_call_id"] == "call_5"
 
 
 def test_turn_commit_preserves_tool_trajectory_for_follow_up():

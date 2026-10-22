@@ -244,8 +244,10 @@ def apply_engine_io_return(
         return [RaiseBoundaryError(code=code, recoverable=recoverable, message=msg)]
 
     if action == GovernanceAction.SKIP:
-        cid = run.next_correlation_id()
-        run.append(RunEvent(correlation_id=cid, response_kind="TOOL_RESULT", next_step="STOP"))
+        # Commit a placeholder under the original cid so _sync_tool_result_memory
+        # can correlate the ingress to its WM slot with a single cid-matched lookup.
+        # Empty text suppresses the real content without leaking it to the LLM.
+        run.append(RunEvent(correlation_id=event.correlation_id, response_kind="TOOL_RESULT", next_step="STOP"))
         q.inflight_kind = "NONE"
         q.dp = DpState.EVALUATING
         return evaluate(q, run, config=config)
