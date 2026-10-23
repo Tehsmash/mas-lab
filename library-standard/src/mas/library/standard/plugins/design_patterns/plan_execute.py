@@ -85,7 +85,9 @@ class PlanExecutePlugin(ReactPlugin):
     def _evaluate(self, q: QProduct, run: RunLedger, config: KernelConfig) -> list[EgressSymbol]:
         if q.dp != DpState.EVALUATING or not run.events:
             return [NoOp()]
-        last = run.events[-1]
+        last = run.latest()
+        if last is None:
+            return [NoOp()]
         phase = str(q.dp_data.get("phase") or _PHASE_PLAN)
 
         if phase == _PHASE_PLAN and last.response_kind in ("MODEL_TEXT", "ERROR"):

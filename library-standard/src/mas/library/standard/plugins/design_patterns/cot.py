@@ -33,7 +33,9 @@ class CotPlugin(ReactPlugin):
     def _evaluate(self, q: QProduct, run: RunLedger, config: KernelConfig) -> list[EgressSymbol]:
         if q.dp != DpState.EVALUATING or not run.events:
             return [NoOp()]
-        last = run.events[-1]
+        last = run.latest()
+        if last is None:
+            return [NoOp()]
         q.model = ModelState.IDLE if q.model == ModelState.DONE else q.model
         q.tool = ToolState.IDLE if q.tool == ToolState.DONE else q.tool
         q.ctx = CtxState.IDLE

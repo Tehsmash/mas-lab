@@ -44,20 +44,31 @@ __all__ = [
 
 @dataclass
 class RunEvent:
-    """One ingress event appended during a turn (correlation id + engine return)."""
+    """One accepted engine fact on the run log (correlation id + payload).
+
+    The chat transcript is a copy of these rows, not a second store.
+    Tool-call name and arguments live here so the copier does not read
+    the engine return before governance has accepted it.
+    """
 
     correlation_id: int
     response_kind: str
     next_step: str
     text: str = ""
+    tool_name: str = ""
+    tool_arguments: dict = field(default_factory=dict)
+    parallel_tools: tuple[tuple[str, dict], ...] = ()
+    finish_reason: str = ""
+    seq: int = 0
 
 
 @dataclass
 class RunLedger:
-    """Ordered run events for the current turn (formal τ tape)."""
+    """Ordered accepted facts for the current run."""
 
     events: list[RunEvent] = field(default_factory=list)
     _allocated_high: int = 0
+    _next_seq: int = 0
 
     @property
     def records(self) -> list[RunEvent]:
@@ -77,18 +88,57 @@ class RunLedger:
     def _sync_allocated(self, correlation_id: int) -> None:
         self._allocated_high = max(self._allocated_high, correlation_id)
 
+    def _stamp(self, record: RunEvent) -> None:
+        self._next_seq += 1
+        record.seq = self._next_seq
+
+    def max_seq(self) -> int:
+        """Highest seq stamped so far (0 if the log is empty)."""
+        return self._next_seq
+
+    def since(self, seen_seq: int) -> list[RunEvent]:
+        """Rows stamped after ``seen_seq``. Inflight sort does not hide them."""
+        return [row for row in self.events if row.seq > seen_seq]
+
+    def latest(self) -> RunEvent | None:
+        """Newest row by ``seq``, not list tail (inflight sort moves the tail)."""
+        if not self.events:
+            return None
+        return max(self.events, key=lambda row: row.seq)
+
     def append(self, record: RunEvent) -> None:
         if self.events and record.correlation_id < self.events[-1].correlation_id:
             raise ValueError("run ledger correlation ids must be monotonic")
+        self._stamp(record)
         self.events.append(record)
         self._sync_allocated(record.correlation_id)
 
     def append_inflight(self, record: RunEvent) -> None:
         if any(r.correlation_id == record.correlation_id for r in self.events):
             raise ValueError("duplicate run ledger correlation id")
+        self._stamp(record)
         self.events.append(record)
         self.events.sort(key=lambda row: row.correlation_id)
         self._sync_allocated(record.correlation_id)
+
+    def append_placeholder(
+        self,
+        *,
+        text: str = "",
+        next_step: str = "LLM_CALL",
+        cid: int | None = None,
+    ) -> RunEvent:
+        """Tool result for a call that did not run (skip, block, blacklist)."""
+        if cid is None:
+            cid = self.next_correlation_id()
+        record = RunEvent(
+            correlation_id=cid,
+            response_kind="TOOL_RESULT",
+            next_step=next_step,
+            text=text,
+        )
+        self.append(record)
+        return record
 
 
 @dataclass

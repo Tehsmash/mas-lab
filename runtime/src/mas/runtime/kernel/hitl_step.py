@@ -9,30 +9,37 @@ from collections.abc import Callable
 from mas.runtime.kernel.config import KernelConfig
 from mas.runtime.kernel.egress_gate import emit_scheduled_egress
 from mas.runtime.kernel.ingress_step import commit_engine_io_return
+from mas.runtime.kernel.state import (
+    CtxState,
+    DpState,
+    LifecycleState,
+    MemoryState,
+    ModelState,
+    QProduct,
+    RunLedger,
+    SessionState,
+    TransportState,
+)
 from mas.runtime.machines.gov import gov_clear_hitl, gov_is_hitl_pending, gov_on_hitl_schedule
 from mas.runtime.machines.tool import tool_on_abort
 from mas.runtime.schema.egress import EgressSymbol, NoOp
 from mas.runtime.schema.hitl import HitlResolveChoice
 from mas.runtime.schema.ingress import EngineIoReturn, HitlResolve
-from mas.runtime.kernel.state import (
-    CtxState,
-    DpState,
-    LifecycleState,
-    ModelState,
-    MemoryState,
-    QProduct,
-    SessionState,
-    RunLedger,
-    RunEvent,
-    ToolState,
-    TransportState,
-)
 
 
 def _clear_ingress_hitl(q: QProduct) -> None:
     q.hitl_pending_ingress = ""
     q.pending_ingress_return = {}
     gov_clear_hitl(q)
+
+
+def _operator_tool_text(*, blocked: bool, tool_ran: bool, tool_name: str, steering: object) -> str:
+    if not blocked and steering:
+        return steering if isinstance(steering, str) else str(steering)
+    verb = "blocked" if blocked else "skipped"
+    if tool_ran:
+        return f"Operator {verb} tool result for '{tool_name}' via HITL."
+    return f"Operator {verb} tool '{tool_name}' via HITL."
 
 
 def _resolve_ingress_hitl(
@@ -46,7 +53,6 @@ def _resolve_ingress_hitl(
     pending = EngineIoReturn.model_validate(dict(q.pending_ingress_return))
     resolution = event.resolution
     steering = event.operator_context.get("steering") or event.operator_context.get("message")
-    steer_text = steering if isinstance(steering, str) else str(steering) if steering else ""
 
     if resolution in {HitlResolveChoice.ALLOW, HitlResolveChoice.SCHEDULE}:
         q.hitl_results_approved_turn = True
@@ -61,18 +67,16 @@ def _resolve_ingress_hitl(
 
     tool_name = q.pending_tool_name or "tool"
     if resolution == HitlResolveChoice.BLOCK:
-        text = f"Operator blocked tool result for '{tool_name}' via HITL."
-        next_step = "LLM_CALL"
+        text = _operator_tool_text(blocked=True, tool_ran=True, tool_name=tool_name, steering=steering)
     elif resolution == HitlResolveChoice.SKIP:
-        if steer_text:
-            text = steer_text
-        else:
-            text = f"Operator skipped tool result for '{tool_name}' via HITL."
-        next_step = "LLM_CALL"
+        text = _operator_tool_text(blocked=False, tool_ran=True, tool_name=tool_name, steering=steering)
     else:
         return [NoOp()]
 
-    modified = pending.model_copy(update={"text": text, "next_step": next_step})
+    if pending.response_kind == "TOOL_RESULT":
+        modified = pending.model_copy(update={"text": text, "next_step": "LLM_CALL"})
+    else:
+        modified = pending.model_copy(update={"text": text, "response_kind": "MODEL_TEXT", "next_step": "STOP"})
     _clear_ingress_hitl(q)
     return commit_engine_io_return(
         q,
@@ -135,24 +139,18 @@ def apply_hitl_resolve(
         gov_clear_hitl(q)
         steering = event.operator_context.get("steering") or event.operator_context.get("message")
         tool_name = q.pending_tool_name or "tool"
-        if resolution == HitlResolveChoice.BLOCK:
-            result_msg = f"Operator blocked tool '{tool_name}' via HITL."
+        blocked = resolution == HitlResolveChoice.BLOCK
+        if blocked:
             q.hitl_block_committed = True
         else:
             q.hitl_skip_committed = True
-            if steering:
-                result_msg = steering if isinstance(steering, str) else str(steering)
-            else:
-                result_msg = f"Operator skipped tool '{tool_name}' via HITL."
-        cid = run.next_correlation_id()
-        run.append(
-            RunEvent(
-                correlation_id=cid,
-                response_kind="TOOL_RESULT",
-                next_step="LLM_CALL",
-                text=result_msg,
-            )
+        result_msg = _operator_tool_text(
+            blocked=blocked,
+            tool_ran=False,
+            tool_name=tool_name,
+            steering=steering,
         )
+        run.append_placeholder(text=result_msg, next_step="LLM_CALL")
         q.scheduled_egress = "LLM_CALL"
         q.dp = DpState.EGRESS_PENDING
         return emit_scheduled_egress(q, run, config)

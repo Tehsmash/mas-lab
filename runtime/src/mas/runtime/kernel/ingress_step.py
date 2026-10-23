@@ -12,6 +12,7 @@ from mas.runtime.kernel.coord_hook import coord_after_ingress, coord_before_ingr
 from mas.runtime.kernel.coupling import (
     apply_control_valid,
     apply_gov_error,
+    apply_gov_terminate,
     apply_ingress_deny,
     gov_plugin_boundary_error,
 )
@@ -24,7 +25,8 @@ from mas.runtime.kernel.envelope import (
 )
 from mas.runtime.kernel.hitl_gate import emit_ingress_hitl_pause
 from mas.runtime.kernel.inflight import dismiss_inflight, pending_for_validate
-from mas.runtime.kernel.state import DpState, QProduct, RunEvent, RunLedger, ToolState
+from mas.runtime.kernel.run_event import from_engine_return
+from mas.runtime.kernel.state import DpState, QProduct, RunLedger, ToolState
 from mas.runtime.machines.context import ctx_on_abort, ctx_on_cycle_reset
 from mas.runtime.machines.memory import memory_on_ingress
 from mas.runtime.machines.model import model_on_abort, model_on_ingress, model_on_preempt
@@ -64,14 +66,7 @@ def commit_engine_io_return(
             )
         ]
     run_append = run.append_inflight if inflight else run.append
-    run_append(
-        RunEvent(
-            correlation_id=event.correlation_id,
-            response_kind=event.response_kind,
-            next_step=event.next_step,
-            text=event.text,
-        )
-    )
+    run_append(from_engine_return(event))
     if event.offered_tools is not None:
         q.offered_tools = tuple(event.offered_tools)
     if event.next_step == "TOOL_CALL":
@@ -243,13 +238,43 @@ def apply_engine_io_return(
         recoverable = ingress_decision.recoverable
         return [RaiseBoundaryError(code=code, recoverable=recoverable, message=msg)]
 
+    if action == GovernanceAction.TERMINATE:
+        apply_gov_terminate(q)
+        return [RaiseBoundaryError(code="INGRESS_GOV_TERMINATE", recoverable=False)]
+
+    if action == GovernanceAction.BLACKLIST:
+        q.tool_blacklisted = True
+        return _commit_skip(q, run, event, config=config, evaluate=evaluate)
+
     if action == GovernanceAction.SKIP:
-        # Commit a placeholder under the original cid so _sync_tool_result_memory
-        # can correlate the ingress to its WM slot with a single cid-matched lookup.
-        # Empty text suppresses the real content without leaking it to the LLM.
-        run.append(RunEvent(correlation_id=event.correlation_id, response_kind="TOOL_RESULT", next_step="STOP"))
-        q.inflight_kind = "NONE"
-        q.dp = DpState.EVALUATING
-        return evaluate(q, run, config=config)
+        return _commit_skip(q, run, event, config=config, evaluate=evaluate)
 
     return commit_engine_io_return(q, run, event, config=config, evaluate=evaluate)
+
+
+def _commit_skip(
+    q: QProduct,
+    run: RunLedger,
+    event: EngineIoReturn,
+    *,
+    config: KernelConfig,
+    evaluate,
+) -> list[EgressSymbol]:
+    """Skip an accepted return without leaking it, and without running a tool.
+
+    A tool result keeps the original id with empty text so the tool machine
+    finishes. A model reply that asked for a tool is stopped; it is not
+    rewritten as a fake tool result (that would still schedule the tool).
+    """
+    if event.response_kind == "TOOL_RESULT":
+        skipped = event.model_copy(update={"text": "", "response_kind": "TOOL_RESULT"})
+        return commit_engine_io_return(q, run, skipped, config=config, evaluate=evaluate)
+    skipped = event.model_copy(
+        update={
+            "response_kind": "MODEL_TEXT",
+            "next_step": "STOP",
+            "tool_name": "",
+            "parallel_tools": (),
+        }
+    )
+    return commit_engine_io_return(q, run, skipped, config=config, evaluate=evaluate)

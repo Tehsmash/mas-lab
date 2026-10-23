@@ -10,6 +10,7 @@ import logging
 import time
 import uuid
 from collections import deque
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Literal
@@ -26,7 +27,9 @@ from mas.runtime.engine.simulated import SimulatedEngine
 from mas.runtime.engine.worker_pool import DEFAULT_ENGINE_QUEUE_DEPTH, EngineWorkerPool
 from mas.runtime.kernel.inflight import pending_for_validate, register_inflight
 from mas.runtime.kernel.orchestrator import RuntimeKernel
+from mas.runtime.kernel.run_event import max_event_seq, new_run_events
 from mas.runtime.kernel.runtime_context import runtime_binding
+from mas.runtime.kernel.state import RunLedger
 from mas.runtime.machines.gov import gov_is_hitl_pending
 from mas.runtime.schema.egress import (
     EgressKind,
@@ -51,6 +54,7 @@ def _within_auto_step_budget(auto_steps: int, max_auto_steps: int | None) -> boo
     overlay such as ``with-hardened`` sets an integer.
     """
     return max_auto_steps is None or auto_steps < max_auto_steps
+
 
 ExchangeKind = Literal[
     "user_in",
@@ -138,27 +142,6 @@ def _exchange_timestamp() -> tuple[float, str]:
         time.perf_counter(),
         datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
     )
-
-
-def _next_unbound_tool_call_id(store: Any, extra_messages: list[Any] | None = None) -> str:
-    """Id of the next assistant tool_call that has no matching tool result yet.
-
-    HITL can dispatch parallel tools one-at-a-time, so tool-result correlation
-    ids do not match the ids recorded on the assistant message. Bind in order.
-    ``extra_messages`` is committed history: HITL pause folds WM there before
-    the tool result arrives.
-    """
-    messages = list(extra_messages or []) + list(getattr(store, "messages", None) or [])
-    declared: list[str] = []
-    for msg in reversed(messages):
-        if msg.get("role") == "assistant" and msg.get("tool_calls"):
-            declared = [str(c.get("id") or "") for c in (msg.get("tool_calls") or []) if c.get("id")]
-            break
-    bound = {str(m.get("tool_call_id") or "") for m in messages if m.get("role") == "tool"}
-    for tid in declared:
-        if tid not in bound:
-            return tid
-    return ""
 
 
 def _engine_payload_json(obj: object) -> str:
@@ -335,6 +318,35 @@ class KernelDriver:
         with runtime_binding(self.coordination, self.observability):
             return await self._afeed_bounded(event)
 
+    def _working_memory_store(self) -> Any | None:
+        ctx = self.ctx
+        if ctx is None:
+            return None
+        return getattr(ctx, "working_memory", None)
+
+    def _run_ledger(self) -> RunLedger | None:
+        run = getattr(self.kernel, "run", None)
+        return run if isinstance(run, RunLedger) else None
+
+    def _ledger_events(self) -> list[Any]:
+        events = getattr(getattr(self.kernel, "run", None), "events", None)
+        return list(events) if isinstance(events, (list, tuple)) else []
+
+    def _after_kernel_step(self, ingress: IngressSymbol, seen_seq: int) -> None:
+        """Copy facts this kernel step just logged into the chat transcript."""
+        run = self._run_ledger()
+        rows = run.since(seen_seq) if run is not None else new_run_events(self._ledger_events(), seen_seq)
+        self._project_log_events(rows)
+        if self.coordination is not None:
+            self.coordination.on_internal_mutation(self.kernel.q, label=ingress.kind.value)
+
+    def _kernel_step(self, ingress: IngressSymbol):
+        run = self._run_ledger()
+        seen_seq = run.max_seq() if run is not None else max_event_seq(self._ledger_events())
+        result = self.kernel.transition(ingress)
+        self._after_kernel_step(ingress, seen_seq)
+        return result
+
     def _feed_bounded(self, event: IngressSymbol) -> DriverTrace:
         trace = DriverTrace()
         queue: deque[IngressSymbol] = deque([event])
@@ -401,11 +413,8 @@ class KernelDriver:
                 self._dispatch_egress(err, trace)
                 break
 
-            result = self.kernel.transition(ingress)
+            result = self._kernel_step(ingress)
             trace.steps.append(DriverStep(ingress=ingress, egress=list(result.egress)))
-            self._sync_tool_result_memory(ingress)
-            if self.coordination is not None:
-                self.coordination.on_internal_mutation(self.kernel.q, label=ingress.kind.value)
 
             halt_err: RaiseBoundaryError | None = None
             for sym in result.egress:
@@ -511,11 +520,8 @@ class KernelDriver:
                 self._dispatch_egress(err, trace)
                 break
 
-            result = self.kernel.transition(ingress)
+            result = self._kernel_step(ingress)
             trace.steps.append(DriverStep(ingress=ingress, egress=list(result.egress)))
-            self._sync_tool_result_memory(ingress)
-            if self.coordination is not None:
-                self.coordination.on_internal_mutation(self.kernel.q, label=ingress.kind.value)
 
             halt_err: RaiseBoundaryError | None = None
             for sym in result.egress:
@@ -860,7 +866,6 @@ class KernelDriver:
         direct: list[IngressSymbol] = []
         parallel_group_id: str | None = None
         if len(ios) > 1 and all(sym.op == "TOOL_CALL" for sym in ios):
-            self._record_parallel_tool_calls(ios, q)
             parallel_group_id = str(uuid.uuid4())
             self._record_parallel_group_obs(ios, q, boundary="start", group_id=parallel_group_id)
         for sym in ios:
@@ -978,7 +983,6 @@ class KernelDriver:
             return []
         parallel_group_id: str | None = None
         if len(ios) > 1 and all(sym.op == "TOOL_CALL" for sym in ios):
-            self._record_parallel_tool_calls(ios, q)
             parallel_group_id = str(uuid.uuid4())
             self._record_parallel_group_obs(ios, q, boundary="start", group_id=parallel_group_id)
         prepared: list[InvokeEngineIo] = []
@@ -1065,11 +1069,7 @@ class KernelDriver:
         text = pop_preempt(self.session_id)
         if text:
             steered = next(
-                (
-                    item
-                    for item in returns
-                    if isinstance(item, EngineIoReturn) and item.finish_reason == "preempted"
-                ),
+                (item for item in returns if isinstance(item, EngineIoReturn) and item.finish_reason == "preempted"),
                 None,
             )
             if steered is None:
@@ -1085,11 +1085,7 @@ class KernelDriver:
         if not replacement:
             return returns
         replaced = next(
-            (
-                item
-                for item in returns
-                if isinstance(item, EngineIoReturn) and item.finish_reason == "replaced"
-            ),
+            (item for item in returns if isinstance(item, EngineIoReturn) and item.finish_reason == "replaced"),
             None,
         )
         if replaced is None:
@@ -1113,7 +1109,8 @@ class KernelDriver:
 
         if not isinstance(ret, EngineIoReturn):
             return
-        self._record_working_memory(io, ret)
+        # Do not write the chat transcript here. The engine return is not an
+        # accepted fact yet; SKIP/BLOCK must not leak into the next prompt.
         # The observability end-event (ENGINE_IO_RETURN) for every op — LLM,
         # tool, and memory alike — is now recorded uniformly by
         # ObsEnvelopeMachine.step() on OBSERVABILITY_POST_EXECUTE (see
@@ -1174,154 +1171,49 @@ class KernelDriver:
                 ),
             )
 
-    def _record_working_memory(self, io: InvokeEngineIo, ret: EngineIoReturn) -> None:
-        """Append to the working_memory context source (in-turn trajectory store)."""
+    def _project_log_events(self, new_rows: Sequence[Any] | None) -> None:
+        """Copy this step's new log rows into the chat transcript.
+
+        ``new_rows`` is ``run.since(snapshot)``. The log keeps the whole
+        session; the transcript is emptied at each turn.
+        """
         ctx = self.ctx
-        if ctx is None:
+        store = self._working_memory_store()
+        if ctx is None or store is None:
             return
-        store = getattr(ctx, "working_memory", None)
-        if store is None:
+        extra = list(getattr(ctx, "committed_messages", None) or [])
+        project_new = getattr(store, "project_new", None)
+        if not callable(project_new):
             return
-        call_id = f"call_{ret.correlation_id if io.op == 'LLM_CALL' else io.correlation_id}"
-        if io.op == "LLM_CALL" and ret.next_step == "PARALLEL_TOOL_CALLS":
-            calls = [
-                (
-                    f"call_{ret.correlation_id}_{idx}",
-                    str(spec.tool_name),
-                    dict(spec.tool_arguments or {}),
-                )
-                for idx, spec in enumerate(ret.parallel_tools)
-            ]
-            if calls:
-                store.record_assistant_tool_calls(calls)
-            return
-        if io.op == "LLM_CALL" and ret.next_step == "TOOL_CALL":
-            store.record_assistant_tool_call(
-                call_id=call_id,
-                tool_name=str(ret.tool_name or "tool"),
-                arguments=dict(ret.tool_arguments or {}),
-            )
-            from mas.runtime.boundary.context.telemetry import record_context_mutation
-
-            if ctx is not None:
-                record_context_mutation(
-                    getattr(ctx, "observability", None),
-                    action="wm_append",
-                    turn_index=int(getattr(ctx, "turn_index", 0) or 0),
-                    correlation_id=ret.correlation_id,
-                    role="assistant",
-                    call_id=call_id,
-                    content=f"tool_call:{ret.tool_name or 'tool'}",
-                    wm_count=len(store.messages),
-                    committed_count=len(getattr(ctx, "committed_messages", []) or []),
-                    op="LLM_CALL",
-                )
-        elif (
-            io.op == "LLM_CALL"
-            and ret.next_step == "STOP"
-            and ret.text
-            and ret.finish_reason != "replaced"
-        ):
-            store.record_assistant_message(ret.text)
-        elif io.op == "TOOL_CALL" and ret.response_kind == "TOOL_RESULT":
-            pass  # defer until ingress governance commits (see _sync_tool_result_memory)
-
-    def _sync_tool_result_memory(self, ingress: IngressSymbol) -> None:
-        from mas.runtime.machines.gov import gov_is_hitl_pending
-        from mas.runtime.schema.ingress import EngineIoReturn
-
-        if gov_is_hitl_pending(self.kernel.q):
-            return
-        # Only sync when the current ingress is itself a TOOL_RESULT — searching
-        # events unconditionally picks up stale unsynced results from previous
-        # turns and writes them into the wrong WM slot (displacing the real result).
-        if not (isinstance(ingress, EngineIoReturn) and ingress.response_kind == "TOOL_RESULT"):
-            return
-        ctx = self.ctx
-        if ctx is None:
-            return
-        store = getattr(ctx, "working_memory", None)
-        if store is None:
-            return
-
-        synced: set[int] = getattr(store, "_synced_tool_result_cids", None) or set()
-        store._synced_tool_result_cids = synced
-
-        ingress_cid = ingress.correlation_id
-        if ingress_cid in synced:
-            return
-        events = getattr(getattr(self.kernel, "run", None), "events", None) or []
-        if not isinstance(events, (list, tuple)):
-            events = []
-
-        # Both ALLOW and SKIP now commit a RunEvent under the ingress cid:
-        # ALLOW via commit_engine_io_return (real text), SKIP via its own
-        # run.append (empty text — suppresses the result without leaking it).
-        # Cids are monotonically increasing so no stale prior-turn event can
-        # share ingress_cid; a single cid-matched lookup is sufficient.
-        cid = 0
-        text = ""
-        for row in events:
-            if int(getattr(row, "correlation_id", 0) or 0) == ingress_cid:
-                if getattr(row, "response_kind", "") == "TOOL_RESULT":
-                    cid = ingress_cid
-                    text = str(getattr(row, "text", "") or "")
-                break
-        if not cid:
-            # Event not yet committed (e.g. governance RETRY re-schedules the
-            # tool without writing a placeholder).  Nothing to write; the
-            # retried result will arrive separately.
-            return
-
-        open_id = getattr(store, "_open_tool_call_id", "") or ""
-        committed = list(getattr(ctx, "committed_messages", None) or [])
-        call_id = _next_unbound_tool_call_id(store, extra_messages=committed) or open_id
-        if not call_id:
-            return
-        if store.messages and store.messages[-1].get("role") == "tool":
-            last_cid = store.messages[-1].get("tool_call_id", "")
-            if last_cid == call_id:
-                if cid:
-                    synced.add(cid)
-                return
-        store.record_tool_result(call_id=call_id, content=str(text))
-        if cid:
-            synced.add(cid)
         from mas.runtime.boundary.context.telemetry import record_context_mutation
 
-        record_context_mutation(
-            getattr(ctx, "observability", None),
-            action="wm_append",
-            turn_index=int(getattr(ctx, "turn_index", 0) or 0),
-            correlation_id=cid,
-            role="tool",
-            call_id=call_id,
-            content=text,
-            wm_count=len(store.messages),
-            committed_count=len(getattr(ctx, "committed_messages", []) or []),
-            op="TOOL_CALL",
-        )
-
-    def _record_parallel_tool_calls(self, ios: list[InvokeEngineIo], q: Any) -> None:
-        ctx = self.ctx
-        if ctx is None:
-            return
-        store = getattr(ctx, "working_memory", None)
-        if store is None:
-            return
-        if store.messages:
-            last = store.messages[-1]
-            if last.get("role") == "assistant" and last.get("tool_calls"):
-                return
-        calls: list[tuple[str, str, dict]] = []
-        for sym in ios:
-            by_cid = q.pending_tools_by_cid.get(sym.correlation_id)
-            if by_cid is None:
+        for row, call_id in project_new(new_rows, extra_messages=extra):
+            kind = str(getattr(row, "response_kind", "") or "")
+            next_step = str(getattr(row, "next_step", "") or "")
+            # Same events as before the copier: tool_call and tool result.
+            # Assistant prose was never a context_mutation.
+            if kind == "TOOL_RESULT":
+                role, op, content = "tool", "TOOL_CALL", str(getattr(row, "text", "") or "")
+            elif next_step in {"TOOL_CALL", "PARALLEL_TOOL_CALLS"}:
+                role, op, content = (
+                    "assistant",
+                    "LLM_CALL",
+                    f"tool_call:{getattr(row, 'tool_name', '') or 'tool'}",
+                )
+            else:
                 continue
-            name, args = by_cid
-            calls.append((f"call_{sym.correlation_id}", str(name), dict(args)))
-        if calls:
-            store.record_assistant_tool_calls(calls)
+            record_context_mutation(
+                getattr(ctx, "observability", None),
+                action="wm_append",
+                turn_index=int(getattr(ctx, "turn_index", 0) or 0),
+                correlation_id=int(getattr(row, "correlation_id", 0) or 0),
+                role=role,
+                call_id=call_id,
+                content=content,
+                wm_count=len(store.messages),
+                committed_count=len(extra),
+                op=op,
+            )
 
     def _record_parallel_group_obs(
         self,

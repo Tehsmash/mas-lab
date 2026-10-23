@@ -133,6 +133,14 @@ def run_to_dict(run: RunLedger) -> dict:
                 "correlation_id": r.correlation_id,
                 "response_kind": r.response_kind,
                 "next_step": r.next_step,
+                "text": r.text,
+                "tool_name": r.tool_name,
+                "tool_arguments": dict(r.tool_arguments or {}),
+                "parallel_tools": [
+                    {"tool_name": name, "tool_arguments": dict(args or {})}
+                    for name, args in (r.parallel_tools or ())
+                ],
+                "finish_reason": r.finish_reason,
             }
             for r in run.events
         ]
@@ -143,11 +151,21 @@ def run_from_dict(data: dict) -> RunLedger:
     ledger = RunLedger()
     rows = data.get("events") or data.get("records") or []
     for row in rows:
+        parallel = tuple(
+            (str(item.get("tool_name") or "tool"), dict(item.get("tool_arguments") or {}))
+            for item in (row.get("parallel_tools") or [])
+            if isinstance(item, dict)
+        )
         ledger.append(
             RunEvent(
                 correlation_id=int(row["correlation_id"]),
                 response_kind=row["response_kind"],
                 next_step=row["next_step"],
+                text=str(row.get("text") or ""),
+                tool_name=str(row.get("tool_name") or ""),
+                tool_arguments=dict(row.get("tool_arguments") or {}),
+                parallel_tools=parallel,
+                finish_reason=str(row.get("finish_reason") or ""),
             )
         )
     return ledger

@@ -62,7 +62,9 @@ class TreeOfThoughtsPlugin(CotPlugin):
     def _evaluate(self, q: QProduct, run: RunLedger, config: KernelConfig) -> list[EgressSymbol]:
         if q.dp != DpState.EVALUATING or not run.events:
             return [NoOp()]
-        last = run.events[-1]
+        last = run.latest()
+        if last is None:
+            return [NoOp()]
         tot_pass = int(q.dp_data.get("tot_pass") or 0)
         max_passes = max(config.max_cot_pass, 2)
 

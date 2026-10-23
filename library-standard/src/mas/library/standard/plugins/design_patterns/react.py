@@ -105,7 +105,9 @@ class ReactPlugin(DesignPatternPlugin):
     def _evaluate(self, q: QProduct, run: RunLedger, config: KernelConfig) -> list[EgressSymbol]:
         if q.dp != DpState.EVALUATING or not run.events:
             return [NoOp()]
-        last = run.events[-1]
+        last = run.latest()
+        if last is None:
+            return [NoOp()]
         q.model = model_on_evaluate(q.model)
         q.tool = tool_on_evaluate(q.tool)
         q.memory = memory_on_evaluate(q.memory)

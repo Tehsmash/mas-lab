@@ -79,6 +79,16 @@ Not yet closed in Python:
 - A plugin can still import and call a lower-level component directly.
 - Not all stateful operations go through one normalized state facade.
 - Several domain-specific hooks exist in parallel with the chokepoint model.
+- The in-turn chat transcript is not part of the kernel state machine. The
+  next prompt is three functions: append an accepted fact, take
+  `run.since(snapshot)` after the kernel step, copy those rows. A new
+  kernel machine or governance action stays covered if it appends when the
+  model should see a fact, and does not append when it should not (pause,
+  retry, hard halt). Searching the session log, writing the transcript from
+  the engine return, or inventing tool-call ids at dispatch, is a bypass:
+  the kernel can be correct while the next model prompt is not. A new
+  `GovernanceAction` needs an explicit arm and a test that checks whether a
+  log row was appended.
 
 ## Why memory is not a tool call
 

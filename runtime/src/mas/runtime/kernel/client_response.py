@@ -17,6 +17,7 @@ def client_response_from_run(
     """Emit ``finish_reason=error`` when the last run event is an engine ERROR."""
     content = response_text_from_run(run, fallback=fallback)
     finish: str = "stop"
-    if run.events and run.events[-1].response_kind == "ERROR":
+    latest = run.latest()
+    if latest is not None and latest.response_kind == "ERROR":
         finish = "error"
     return EmitClientResponse(content=content, finish_reason=finish)  # type: ignore[arg-type]

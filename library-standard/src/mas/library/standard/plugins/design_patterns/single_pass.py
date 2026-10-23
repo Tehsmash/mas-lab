@@ -94,5 +94,6 @@ class SinglePassPlugin(DesignPatternPlugin):
         q.inflight_kind = "NONE"
         q.dp = DpState.IDLE
         q.ctx = CtxState.IDLE
-        content = response_text_from_run(run, fallback=run.events[-1].text or "Done.")
+        latest = run.latest()
+        content = response_text_from_run(run, fallback=(latest.text if latest is not None else "") or "Done.")
         return [EmitClientResponse(content=content)]

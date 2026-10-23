@@ -34,7 +34,6 @@ from mas.runtime.kernel.inflight import register_inflight
 from mas.runtime.kernel.state import (
     DpState,
     QProduct,
-    RunEvent,
     RunLedger,
     ScheduledEgress,
 )
@@ -59,9 +58,14 @@ def _destructive_for_op(op: ScheduledEgress, config: KernelConfig) -> bool:
     return config.gov_trigger_destructive
 
 
-def _append_synthetic_skip(q: QProduct, run: RunLedger) -> None:
-    cid = run.next_correlation_id()
-    run.append(RunEvent(correlation_id=cid, response_kind="TOOL_RESULT", next_step="STOP"))
+def _append_synthetic_skip(
+    q: QProduct,
+    run: RunLedger,
+    *,
+    text: str = "",
+    next_step: str = "STOP",
+) -> None:
+    run.append_placeholder(text=text, next_step=next_step)
     q.model = model_on_abort(q.model)
     q.tool = tool_on_abort(q.tool)
     q.inflight_kind = "NONE"
@@ -81,14 +85,7 @@ def _feed_blocked_tool_to_model(
     q.scheduled_egress = "NONE"
     q.inflight_kind = "NONE"
     q.tool = tool_on_abort(q.tool)
-    run.append(
-        RunEvent(
-            correlation_id=cid,
-            response_kind="TOOL_RESULT",
-            next_step="LLM_CALL",
-            text=text,
-        )
-    )
+    run.append_placeholder(cid=cid, text=text, next_step="LLM_CALL")
     q.scheduled_egress = "LLM_CALL"
     q.dp = DpState.EGRESS_PENDING
     return emit_scheduled_egress(q, run, config)
@@ -147,20 +144,11 @@ def emit_scheduled_egress(q: QProduct, run: RunLedger, config: KernelConfig) -> 
     op = q.scheduled_egress
     if op == "TOOL_CALL" and q.hitl_block_committed:
         q.scheduled_egress = "NONE"
-        cid = run.next_correlation_id()
-        run.append(
-            RunEvent(
-                correlation_id=cid,
-                response_kind="TOOL_RESULT",
-                next_step="STOP",
-                text="Tool call suppressed after operator HITL block.",
-            )
+        _append_synthetic_skip(
+            q,
+            run,
+            text="Tool call suppressed after operator HITL block.",
         )
-        q.model = model_on_abort(q.model)
-        q.tool = tool_on_abort(q.tool)
-        q.inflight_kind = "NONE"
-        q.dp = DpState.EVALUATING
-        control_on_idle(q)
         return [NoOp()]
 
     enter_egress_chokepoint(q)
@@ -229,9 +217,7 @@ def emit_scheduled_egress(q: QProduct, run: RunLedger, config: KernelConfig) -> 
 
     if decision == GovDecision.BLOCK:
         # Capture before close_envelope: ingress validate overwrites gov_reason.
-        block_reason = env_ctx.gov_reason or (
-            f"Tool '{q.pending_tool_name}' is not allowed."
-        )
+        block_reason = env_ctx.gov_reason or (f"Tool '{q.pending_tool_name}' is not allowed.")
         close_envelope(env_ctx, error="GOV_BLOCK")
         if op == "TOOL_CALL":
             # Same recovery path as HITL BLOCK: do not run the tool, put the
